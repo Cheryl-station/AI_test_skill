@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=65.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "api-test-kit"
+version = "0.1.0"
+description = "Small API smoke-test generator and runner for Python projects."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+keywords = ["testing", "API", "OpenAPI", "pytest", "automation"]
+authors = [
+    { name = "Tangyajun" },
+]
+dependencies = [
+    "requests>=2.28.0",
+    "pytest>=8.0.0",
+    "PyYAML>=6.0",
+    "Flask>=2.0.0",
+]
+
+[project.scripts]
+api-test-kit = "api_test_kit:main"
+
+[tool.setuptools]
+py-modules = ["api_test_kit"]
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+addopts = "-q"
+testpaths = ["tests"]
