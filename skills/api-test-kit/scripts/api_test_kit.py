@@ -359,6 +359,17 @@ def make_test_name(path: str, method: str) -> str:
     return f"{name}_{method.lower()}_smoke"
 
 
+def python_literal(value: str) -> str:
+    return repr(value)
+
+
+def example_path(path: str) -> str:
+    path = re.sub(r"\{[^}/]+\}", "1", path)
+    path = re.sub(r"<(?:[^:<>]+:)?[^<>]+>", "1", path)
+    path = re.sub(r":([A-Za-z_][A-Za-z0-9_]*)", "1", path)
+    return path
+
+
 def generate_tests(
     frontend: Dict[str, str],
     backend: Dict[str, str],
@@ -386,7 +397,10 @@ def generate_tests(
 
     if data_driven:
         entries = ",\n".join(
-            f"    ('{endpoint['path']}', '{endpoint['methods'][0]}', {default_payload(endpoint['methods'][0])})"
+            "    "
+            f"({python_literal(example_path(endpoint['path']))}, "
+            f"{python_literal(endpoint['methods'][0])}, "
+            f"{default_payload(endpoint['methods'][0])})"
             for endpoint in endpoints
         )
         return [{
@@ -396,7 +410,7 @@ def generate_tests(
             "code": (
                 "import pytest\n"
                 "import requests\n\n"
-                f"BASE_URL = \"{api_base_url}\"\n\n"
+                f"BASE_URL = {python_literal(api_base_url)}\n\n"
                 "@pytest.mark.parametrize('path,method,payload', [\n"
                 f"{entries}\n"
                 "])\n"
@@ -420,16 +434,17 @@ def generate_tests(
             )
             request_payload = ", json=json_payload"
         test_name = make_test_name(endpoint["path"], method)
+        rendered_path = python_literal(example_path(endpoint["path"]))
         tests.append({
             "id": f"api_{index}_{test_name}",
             "title": f"{endpoint['methods'][0]} {endpoint['path']} smoke test",
             "description": f"Smoke check for {endpoint['methods'][0]} {endpoint['path']}.",
             "code": (
                 "import requests\n\n"
-                f"BASE_URL = \"{api_base_url}\"\n\n"
+                f"BASE_URL = {python_literal(api_base_url)}\n\n"
                 f"def test_{test_name}():\n"
                 f"{request_block}"
-                f"    response = requests.{method}(f\"{{BASE_URL}}{endpoint['path']}\"{request_payload})\n"
+                f"    response = requests.{method}(BASE_URL + {rendered_path}{request_payload})\n"
                 "    assert response.status_code in (200, 201, 204, 400, 404)\n"
             ),
         })
@@ -757,22 +772,27 @@ def main() -> int:
             print(str(exc), file=sys.stderr)
             return 1
 
-    tests = generate_tests(frontend, backend, args.mode, args.api_base_url, openapi_docs, args.data_driven)
-    written_files = write_tests(tests, args.output_dir)
-    summary["generated_tests"] = [str(path) for path in written_files]
+    try:
+        tests = generate_tests(frontend, backend, args.mode, args.api_base_url, openapi_docs, args.data_driven)
+        written_files = write_tests(tests, args.output_dir)
+        summary["generated_tests"] = [str(path) for path in written_files]
 
-    result = run_pytest(args.output_dir, args.report_file)
-    summary["pytest_returncode"] = result["returncode"]
-    summary["pytest_stdout"] = result["stdout"]
-    summary["pytest_stderr"] = result["stderr"]
-    summary["report_file"] = result["report_path"]
-    summary["html_report_file"] = str(args.html_report_file)
-    save_summary(summary, args.summary_file)
-    save_chinese_report(summary, args.report_file, args.html_report_file)
-
-    if service_process:
-        service_process.terminate()
-        service_process.wait(timeout=5)
+        result = run_pytest(args.output_dir, args.report_file)
+        summary["pytest_returncode"] = result["returncode"]
+        summary["pytest_stdout"] = result["stdout"]
+        summary["pytest_stderr"] = result["stderr"]
+        summary["report_file"] = result["report_path"]
+        summary["html_report_file"] = str(args.html_report_file)
+        save_summary(summary, args.summary_file)
+        save_chinese_report(summary, args.report_file, args.html_report_file)
+    finally:
+        if service_process:
+            service_process.terminate()
+            try:
+                service_process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                service_process.kill()
+                service_process.wait(timeout=5)
 
     print(json.dumps(summary, indent=2, ensure_ascii=False))
     return result["returncode"]

@@ -76,9 +76,9 @@ api-test-kit --help
 本仓库同时包含可发布的 Codex skill 包，路径为 `skills/api-test-kit`。可以从 GitHub 仓库路径安装：
 
 ```bash
-python scripts/install-skill-from-github.py \
-  --repo Cheryl-station/AI_test_skill \
-  --path skills/api-test-kit
+git clone https://github.com/Cheryl-station/AI_test_skill.git
+mkdir -p "${CODEX_HOME:-$HOME/.codex}/skills"
+cp -R AI_test_skill/skills/api-test-kit "${CODEX_HOME:-$HOME/.codex}/skills/api-test-kit"
 ```
 
 安装后重启 Codex，即可通过 `$api-test-kit` 调用该技能。

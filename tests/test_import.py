@@ -97,3 +97,53 @@ def test_detect_project_inputs_falls_back_to_project_root(tmp_path):
 
     assert detected["frontend_paths"] == [tmp_path]
     assert detected["backend_paths"] == [tmp_path]
+
+
+def test_generated_tests_escape_dynamic_paths_and_literals():
+    module = importlib.import_module("api_test_kit")
+    openapi_docs = {
+        "openapi.yaml": {
+            "paths": {
+                "/users/{id}/notes/:note_id": {
+                    "get": {"summary": "Fetch a user's note"},
+                },
+            },
+        },
+    }
+
+    tests = module.generate_tests(
+        frontend={},
+        backend={},
+        api_base_url="http://localhost:5000/'quoted'",
+        openapi_docs=openapi_docs,
+    )
+
+    code = tests[0]["code"]
+    compile(code, "<generated-test>", "exec")
+    assert "/users/1/notes/1" in code
+    assert "{id}" not in code
+
+
+def test_data_driven_generated_tests_escape_literals():
+    module = importlib.import_module("api_test_kit")
+    openapi_docs = {
+        "openapi.yaml": {
+            "paths": {
+                "/widgets/{widget_id}": {
+                    "post": {"summary": "Create widget"},
+                },
+            },
+        },
+    }
+
+    tests = module.generate_tests(
+        frontend={},
+        backend={},
+        api_base_url="http://localhost:5000/'quoted'",
+        openapi_docs=openapi_docs,
+        data_driven=True,
+    )
+
+    code = tests[0]["code"]
+    compile(code, "<generated-data-driven-test>", "exec")
+    assert "('/widgets/1', 'POST'" in code
