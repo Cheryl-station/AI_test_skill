@@ -1,0 +1,4 @@
+interface:
+  display_name: "API Test Kit"
+  short_description: "自动扫描项目接口生成冒烟测试并输出中文HTML测试报告"
+  default_prompt: "Use $api-test-kit to scan this project, generate and run API smoke tests, then produce a Chinese HTML report."

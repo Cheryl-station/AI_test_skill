@@ -71,6 +71,18 @@ api-test-kit --help
 - `--html-report-file`：中文 HTML 报告输出路径，默认 `artifacts/report.html`。
 - `--dry-run`：只扫描输入并写入摘要，不生成和执行测试。
 
+## 作为 Codex Skill 安装
+
+本仓库同时包含可发布的 Codex skill 包，路径为 `skills/api-test-kit`。可以从 GitHub 仓库路径安装：
+
+```bash
+python scripts/install-skill-from-github.py \
+  --repo yajuntang/AI_test_skill \
+  --path skills/api-test-kit
+```
+
+安装后重启 Codex，即可通过 `$api-test-kit` 调用该技能。
+
 ## 本地开发
 
 运行测试：
