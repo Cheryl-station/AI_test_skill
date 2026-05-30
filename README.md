@@ -77,7 +77,7 @@ api-test-kit --help
 
 ```bash
 python scripts/install-skill-from-github.py \
-  --repo yajuntang/AI_test_skill \
+  --repo Cheryl-station/AI_test_skill \
   --path skills/api-test-kit
 ```
 
