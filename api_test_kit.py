@@ -5,6 +5,7 @@ import argparse
 import html
 import importlib.util
 import json
+import os
 import re
 import subprocess
 import sys
@@ -12,7 +13,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 from xml.etree import ElementTree
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 try:
     import requests
@@ -50,6 +51,12 @@ DEFAULT_SUMMARY_FILE = Path("artifacts/summary.json")
 DEFAULT_HTML_REPORT_FILE = Path("artifacts/report.html")
 API_DEFAULT_BASE_URL = "http://localhost:8000"
 SERVICE_STARTUP_POLL_INTERVAL = 0.5
+SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
+MUTATING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+LEGACY_EXPECTED_STATUS = [200, 201, 204, 400, 404]
+SUPPORTED_ASSERTION_OPS = {"eq", "ne", "exists", "not_exists", "not_empty", "contains", "in", "type", "regex", "length"}
+SENSITIVE_KEY_PATTERN = re.compile(r"(authorization|cookie|token|password|secret|api[-_]?key)", re.IGNORECASE)
+ENV_PATTERN = re.compile(r"\$\{ENV:([A-Za-z_][A-Za-z0-9_]*)\}")
 PYTHON_DEPENDENCIES = {
     "requests": "requests",
     "pytest": "pytest",
@@ -152,6 +159,312 @@ def load_openapi_documents(paths: List[Path]) -> Dict[str, dict]:
     return openapi_docs
 
 
+def resolve_env_vars(value: Any, missing: Optional[List[str]] = None) -> Any:
+    """Resolve ${ENV:NAME} placeholders without evaluating arbitrary code."""
+    if missing is None:
+        missing = []
+    if isinstance(value, dict):
+        return {key: resolve_env_vars(item, missing) for key, item in value.items()}
+    if isinstance(value, list):
+        return [resolve_env_vars(item, missing) for item in value]
+    if isinstance(value, str):
+        def replace(match: re.Match) -> str:
+            name = match.group(1)
+            env_value = os.environ.get(name)
+            if env_value is None:
+                missing.append(name)
+                return match.group(0)
+            return env_value
+        return ENV_PATTERN.sub(replace, value)
+    return value
+
+
+def load_case_config(path: Optional[Path]) -> Dict[str, Any]:
+    if not path:
+        return {"version": 1, "defaults": {}, "endpoints": {}, "missing_env": []}
+    if yaml is None:
+        raise RuntimeError("缺少 PyYAML 依赖，无法读取 --case-config。")
+    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    if not isinstance(raw, dict):
+        raise ValueError("case_config.yaml 顶层必须是对象。")
+    missing: List[str] = []
+    resolved = resolve_env_vars(raw, missing)
+    resolved.setdefault("version", 1)
+    resolved.setdefault("defaults", {})
+    resolved.setdefault("endpoints", {})
+    if not isinstance(resolved["defaults"], dict) or not isinstance(resolved["endpoints"], dict):
+        raise ValueError("case_config.yaml 的 defaults 和 endpoints 必须是对象。")
+    resolved["missing_env"] = sorted(set(missing))
+    return resolved
+
+
+def endpoint_key(method: str, path: str) -> str:
+    return f"{method.upper()} {path}"
+
+
+def parse_endpoint_key(key: str) -> Tuple[str, str]:
+    method, _, path = key.strip().partition(" ")
+    return method.upper(), path.strip()
+
+
+def get_endpoint_config(case_config: Optional[Dict[str, Any]], method: str, path: str) -> Dict[str, Any]:
+    if not case_config:
+        return {}
+    endpoint_config = case_config.get("endpoints", {}).get(endpoint_key(method, path), {})
+    if endpoint_config is None:
+        endpoint_config = {}
+    if not isinstance(endpoint_config, dict):
+        raise ValueError(f"接口配置必须是对象：{endpoint_key(method, path)}")
+    defaults = case_config.get("defaults", {}) or {}
+    merged = {**defaults, **endpoint_config}
+    if endpoint_config:
+        merged["_configured"] = True
+    if case_config.get("missing_env"):
+        merged["_missing_env"] = case_config["missing_env"]
+    return merged
+
+
+def redact_sensitive(value: Any, parent_key: str = "") -> Any:
+    if isinstance(value, dict):
+        redacted = {}
+        for key, item in value.items():
+            if SENSITIVE_KEY_PATTERN.search(str(key)):
+                redacted[key] = redact_scalar(item)
+            else:
+                redacted[key] = redact_sensitive(item, str(key))
+        return redacted
+    if isinstance(value, list):
+        return [redact_sensitive(item, parent_key) for item in value]
+    if SENSITIVE_KEY_PATTERN.search(parent_key):
+        return redact_scalar(value)
+    return value
+
+
+def redact_scalar(value: Any) -> str:
+    text = "" if value is None else str(value)
+    if not text:
+        return ""
+    if len(text) <= 8:
+        return "***"
+    return f"{text[:4]}***{text[-2:]}"
+
+
+def truncate_and_redact(value: Any, limit: int = 2000) -> str:
+    text = value if isinstance(value, str) else json.dumps(redact_sensitive(value), ensure_ascii=False)
+    if text[:1] in "[{":
+        try:
+            text = json.dumps(redact_sensitive(json.loads(text)), ensure_ascii=False)
+        except json.JSONDecodeError:
+            pass
+    if len(text) > limit:
+        return text[:limit] + "...[truncated]"
+    return text
+
+
+def extract_path_param_names(path: str) -> List[str]:
+    names = re.findall(r"\{([^}/]+)\}", path)
+    names.extend(re.findall(r"<(?:[^:<>]+:)?([^<>]+)>", path))
+    names.extend(re.findall(r":([A-Za-z_][A-Za-z0-9_]*)", path))
+    return sorted(set(names))
+
+
+def apply_path_params(path: str, path_params: Dict[str, Any]) -> Tuple[str, List[str]]:
+    missing = []
+    rendered = path
+    for name in extract_path_param_names(path):
+        if name not in path_params or path_params[name] in (None, ""):
+            missing.append(name)
+            continue
+        value = str(path_params[name])
+        rendered = rendered.replace("{" + name + "}", value)
+        rendered = re.sub(rf"<(?:[^:<>]+:)?{re.escape(name)}>", value, rendered)
+        rendered = re.sub(rf":{re.escape(name)}\b", value, rendered)
+    return rendered, missing
+
+
+def _path_tokens(path: str) -> List[Any]:
+    tokens: List[Any] = []
+    for part in path.split("."):
+        match = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)(?:\[(\d+)\])?", part)
+        if not match:
+            tokens.append(part)
+            continue
+        tokens.append(match.group(1))
+        if match.group(2) is not None:
+            tokens.append(int(match.group(2)))
+    return tokens
+
+
+def get_json_path(payload: Any, path: str) -> Tuple[bool, Any]:
+    current = payload
+    for token in _path_tokens(path):
+        if isinstance(token, int):
+            if not isinstance(current, list) or token >= len(current):
+                return False, None
+            current = current[token]
+        else:
+            if not isinstance(current, dict) or token not in current:
+                return False, None
+            current = current[token]
+    return True, current
+
+
+def assert_business(payload: Any, assertion: Dict[str, Any]) -> Dict[str, Any]:
+    path = assertion.get("path", "")
+    op = assertion.get("op")
+    expected = assertion.get("value")
+    exists, actual = get_json_path(payload, path)
+    passed = False
+    if op == "eq":
+        passed = exists and actual == expected
+    elif op == "ne":
+        passed = (not exists) or actual != expected
+    elif op == "exists":
+        passed = exists
+    elif op == "not_exists":
+        passed = not exists
+    elif op == "not_empty":
+        passed = exists and actual not in (None, "", [], {})
+    elif op == "contains":
+        try:
+            passed = exists and expected in actual
+        except TypeError:
+            passed = False
+    elif op == "in":
+        try:
+            passed = exists and actual in expected
+        except TypeError:
+            passed = False
+    elif op == "type":
+        type_map = {"str": str, "string": str, "int": int, "integer": int, "float": float, "number": (int, float), "bool": bool, "boolean": bool, "list": list, "array": list, "dict": dict, "object": dict, "null": type(None)}
+        passed = exists and isinstance(actual, type_map.get(str(expected).lower(), object))
+    elif op == "regex":
+        passed = exists and re.search(str(expected), str(actual)) is not None
+    elif op == "length":
+        passed = exists and hasattr(actual, "__len__") and len(actual) == expected
+    else:
+        raise AssertionError(f"不支持的断言操作：{op}")
+    return {"path": path, "op": op, "expected": expected, "actual": actual if exists else "<missing>", "passed": passed}
+
+
+def run_business_assertions(payload: Any, assertions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    results = []
+    for assertion in assertions or []:
+        if assertion.get("op") not in SUPPORTED_ASSERTION_OPS:
+            raise AssertionError(f"不支持的断言操作：{assertion.get('op')}")
+        result = assert_business(payload, assertion)
+        results.append(result)
+        if not result["passed"]:
+            raise AssertionError(
+                f"业务断言失败 path={result['path']} op={result['op']} "
+                f"expected={result['expected']!r} actual={result['actual']!r}"
+            )
+    return results
+
+
+def schema_default_value(schema: Dict[str, Any]) -> Any:
+    if not isinstance(schema, dict):
+        return "example"
+    if "example" in schema:
+        return schema["example"]
+    if "default" in schema:
+        return schema["default"]
+    if schema.get("enum"):
+        return schema["enum"][0]
+    schema_type = schema.get("type")
+    if schema_type == "integer":
+        return 1
+    if schema_type == "number":
+        return 1.0
+    if schema_type == "boolean":
+        return True
+    if schema_type == "array":
+        return [schema_default_value(schema.get("items", {"type": "string"}))]
+    if schema_type == "object" or "properties" in schema:
+        return {key: schema_default_value(value) for key, value in (schema.get("properties") or {}).items()}
+    return "example"
+
+
+def openapi_request_parts(endpoint: Dict[str, Any]) -> Dict[str, Any]:
+    spec = endpoint.get("spec") if isinstance(endpoint.get("spec"), dict) else {}
+    parts: Dict[str, Any] = {"headers": {}, "query": {}, "path_params": {}, "json": None, "form": None}
+    for parameter in spec.get("parameters", []) or []:
+        if not isinstance(parameter, dict):
+            continue
+        name = parameter.get("name")
+        location = parameter.get("in")
+        if not name or location not in {"header", "query", "path"}:
+            continue
+        value = schema_default_value(parameter.get("schema", {}))
+        if "example" in parameter:
+            value = parameter["example"]
+        target = {"header": "headers", "query": "query", "path": "path_params"}[location]
+        parts[target][name] = value
+    request_body = spec.get("requestBody", {}) if isinstance(spec.get("requestBody"), dict) else {}
+    content = request_body.get("content", {}) if isinstance(request_body.get("content"), dict) else {}
+    json_content = content.get("application/json")
+    form_content = content.get("application/x-www-form-urlencoded") or content.get("multipart/form-data")
+    if isinstance(json_content, dict):
+        parts["json"] = json_content.get("example", schema_default_value(json_content.get("schema", {})))
+    elif isinstance(form_content, dict):
+        form_value = form_content.get("example", schema_default_value(form_content.get("schema", {})))
+        parts["form"] = form_value if isinstance(form_value, dict) else {}
+    return parts
+
+
+def build_request_case(
+    endpoint: Dict[str, Any],
+    api_base_url: str = API_DEFAULT_BASE_URL,
+    case_config: Optional[Dict[str, Any]] = None,
+    allow_mutating_methods: bool = False,
+) -> Dict[str, Any]:
+    method = endpoint["methods"][0].upper()
+    raw_path = str(endpoint["path"])
+    config = get_endpoint_config(case_config, method, raw_path)
+    configured = bool(config.get("_configured"))
+    openapi_parts = openapi_request_parts(endpoint)
+    path_params = {**openapi_parts["path_params"], **(config.get("path_params") or {})}
+    if not path_params and not configured:
+        path_params = {name: 1 for name in extract_path_param_names(raw_path)}
+    rendered_path, missing_path_params = apply_path_params(raw_path, path_params)
+    request_data = {
+        "headers": {**openapi_parts["headers"], **(config.get("headers") or {})},
+        "query": {**openapi_parts["query"], **(config.get("query") or {})},
+        "json": config.get("json", openapi_parts.get("json")),
+        "form": config.get("form", openapi_parts.get("form")),
+    }
+    expected_status = config.get("expected_status", LEGACY_EXPECTED_STATUS)
+    if isinstance(expected_status, int):
+        expected_status = [expected_status]
+    skip_reason = ""
+    if config.get("enabled") is False:
+        skip_reason = "case_config enabled=false"
+    elif config.get("_missing_env"):
+        skip_reason = "环境变量不存在：" + ", ".join(config["_missing_env"])
+    elif missing_path_params:
+        skip_reason = "缺少必填 path_params：" + ", ".join(missing_path_params)
+    elif method in MUTATING_METHODS and not allow_mutating_methods:
+        skip_reason = "修改类请求默认跳过：缺少 --allow-mutating-methods"
+    elif method in MUTATING_METHODS and not config.get("allow_mutating"):
+        skip_reason = "修改类请求默认跳过：接口配置未设置 allow_mutating: true"
+    return {
+        "name": make_test_name(raw_path, method),
+        "method": method,
+        "path": raw_path,
+        "url": api_base_url.rstrip("/") + rendered_path,
+        "source": endpoint.get("source", ""),
+        "source_kind": endpoint.get("kind", ""),
+        "summary": endpoint.get("summary", ""),
+        "timeout": config.get("timeout", 10),
+        "expected_status": expected_status,
+        "assertions": config.get("assertions", []),
+        "configured": configured,
+        "skip_reason": skip_reason,
+        "request": request_data,
+        "redacted_request": redact_sensitive(request_data),
+    }
+
+
 def extract_openapi_endpoints(openapi_docs: Dict[str, dict]) -> List[Dict[str, object]]:
     endpoints = []
     for path, document in openapi_docs.items():
@@ -161,14 +474,19 @@ def extract_openapi_endpoints(openapi_docs: Dict[str, dict]) -> List[Dict[str, o
             if not isinstance(methods, dict):
                 continue
             for method, spec in methods.items():
-                if method.upper() not in {"GET", "POST", "PUT", "DELETE", "PATCH"}:
+                if method.upper() not in {"GET", "HEAD", "OPTIONS", "POST", "PUT", "DELETE", "PATCH"}:
                     continue
+                combined_spec = spec if isinstance(spec, dict) else {}
+                path_parameters = methods.get("parameters", []) if isinstance(methods.get("parameters"), list) else []
+                operation_parameters = combined_spec.get("parameters", []) if isinstance(combined_spec.get("parameters"), list) else []
+                combined_spec = {**combined_spec, "parameters": path_parameters + operation_parameters}
                 endpoints.append({
                     "source": path,
                     "path": route,
                     "methods": [method.upper()],
                     "kind": "openapi",
                     "summary": spec.get("summary", "") if isinstance(spec, dict) else "",
+                    "spec": combined_spec,
                 })
     return endpoints
 
@@ -370,6 +688,79 @@ def example_path(path: str) -> str:
     return path
 
 
+def endpoints_with_case_config(endpoints: List[Dict[str, Any]], case_config: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not case_config:
+        return endpoints
+    seen = {endpoint_key(endpoint["methods"][0], endpoint["path"]) for endpoint in endpoints}
+    merged = list(endpoints)
+    for key in case_config.get("endpoints", {}):
+        method, path = parse_endpoint_key(key)
+        if not method or not path or key in seen:
+            continue
+        merged.append({
+            "source": "case_config",
+            "path": path,
+            "methods": [method],
+            "kind": "case-config",
+            "summary": "",
+        })
+        seen.add(key)
+    return merged
+
+
+def generated_test_code(cases: List[Dict[str, Any]], api_base_url: str) -> str:
+    generated_cases = []
+    for case in cases:
+        generated_cases.append({
+            "name": case["name"],
+            "method": case["method"],
+            "url": case["url"],
+            "timeout": case["timeout"],
+            "expected_status": case["expected_status"],
+            "assertions": case["assertions"],
+            "skip_reason": case["skip_reason"],
+            "request": case["request"],
+            "redacted_request": case["redacted_request"],
+        })
+    return (
+        "import json\n"
+        "import time\n"
+        "import pytest\n"
+        "import requests\n"
+        "from api_test_kit import run_business_assertions, truncate_and_redact\n\n"
+        f"BASE_URL = {python_literal(api_base_url)}\n"
+        f"CASES = {repr(generated_cases)}\n\n"
+        "@pytest.mark.parametrize('case', CASES, ids=[case['name'] for case in CASES])\n"
+        "def test_api_endpoint(case):\n"
+        "    if case.get('skip_reason'):\n"
+        "        pytest.skip(case['skip_reason'])\n"
+        "    request_kwargs = {\n"
+        "        'headers': case['request'].get('headers') or None,\n"
+        "        'params': case['request'].get('query') or None,\n"
+        "        'timeout': case.get('timeout', 10),\n"
+        "    }\n"
+        "    if case['request'].get('json') is not None:\n"
+        "        request_kwargs['json'] = case['request']['json']\n"
+        "    if case['request'].get('form') is not None:\n"
+        "        request_kwargs['data'] = case['request']['form']\n"
+        "    started = time.perf_counter()\n"
+        "    response = requests.request(case['method'], case['url'], **request_kwargs)\n"
+        "    elapsed_ms = round((time.perf_counter() - started) * 1000, 2)\n"
+        "    response_text = truncate_and_redact(response.text, 2000)\n"
+        "    assert response.status_code in case['expected_status'], (\n"
+        "        f\"状态码断言失败 method={case['method']} url={case['url']} \"\n"
+        "        f\"expected={case['expected_status']} actual={response.status_code} \"\n"
+        "        f\"elapsed_ms={elapsed_ms} request={case['redacted_request']} response={response_text}\"\n"
+        "    )\n"
+        "    if case.get('assertions'):\n"
+        "        try:\n"
+        "            payload = response.json()\n"
+        "        except ValueError as exc:\n"
+        "            raise AssertionError(f\"响应不是 JSON，无法执行业务断言：{response_text}\") from exc\n"
+        "        run_business_assertions(payload, case['assertions'])\n"
+    )
+
+
 def generate_tests(
     frontend: Dict[str, str],
     backend: Dict[str, str],
@@ -377,6 +768,8 @@ def generate_tests(
     api_base_url: str = API_DEFAULT_BASE_URL,
     openapi_docs: Optional[Dict[str, dict]] = None,
     data_driven: bool = False,
+    case_config: Optional[Dict[str, Any]] = None,
+    allow_mutating_methods: bool = False,
 ) -> List[Dict[str, str]]:
     if mode != "api":
         return [{
@@ -386,7 +779,7 @@ def generate_tests(
             "code": "def test_project_placeholder():\n    assert True\n",
         }]
 
-    endpoints = extract_api_endpoints({**frontend, **backend}, openapi_docs)
+    endpoints = endpoints_with_case_config(extract_api_endpoints({**frontend, **backend}, openapi_docs), case_config)
     if not endpoints:
         return [{
             "id": "api_placeholder",
@@ -396,12 +789,13 @@ def generate_tests(
         }]
 
     if data_driven:
+        cases = [build_request_case(endpoint, api_base_url, case_config, allow_mutating_methods) for endpoint in endpoints]
         entries = ",\n".join(
             "    "
-            f"({python_literal(example_path(endpoint['path']))}, "
-            f"{python_literal(endpoint['methods'][0])}, "
-            f"{default_payload(endpoint['methods'][0])})"
-            for endpoint in endpoints
+            f"({python_literal(case['url'].replace(api_base_url.rstrip('/'), '', 1))}, "
+            f"{python_literal(case['method'])}, "
+            f"{repr(case['request'].get('json') or case['request'].get('form') or {})})"
+            for case in cases
         )
         return [{
             "id": "api_smoke_matrix",
@@ -415,40 +809,21 @@ def generate_tests(
                 f"{entries}\n"
                 "])\n"
                 "def test_api_endpoint_smoke(path, method, payload):\n"
+                "    if method in {'POST', 'PUT', 'PATCH', 'DELETE'}:\n"
+                "        pytest.skip('修改类请求默认跳过：缺少 --allow-mutating-methods')\n"
                 "    response = requests.request(method, f\"{BASE_URL}{path}\", json=payload if payload else None)\n"
-                "    assert response.status_code < 500\n"
+                f"    assert response.status_code in {tuple(LEGACY_EXPECTED_STATUS)}\n"
             ),
         }]
 
-    tests = []
-    for index, endpoint in enumerate(endpoints, start=1):
-        method = endpoint["methods"][0].lower()
-        request_block = ""
-        request_payload = ""
-        if method in {"post", "put", "patch"}:
-            request_block = (
-                "    json_payload = {\n"
-                "        \"name\": \"example\",\n"
-                "        \"age\": 1,\n"
-                "    }\n"
-            )
-            request_payload = ", json=json_payload"
-        test_name = make_test_name(endpoint["path"], method)
-        rendered_path = python_literal(example_path(endpoint["path"]))
-        tests.append({
-            "id": f"api_{index}_{test_name}",
-            "title": f"{endpoint['methods'][0]} {endpoint['path']} smoke test",
-            "description": f"Smoke check for {endpoint['methods'][0]} {endpoint['path']}.",
-            "code": (
-                "import requests\n\n"
-                f"BASE_URL = {python_literal(api_base_url)}\n\n"
-                f"def test_{test_name}():\n"
-                f"{request_block}"
-                f"    response = requests.{method}(BASE_URL + {rendered_path}{request_payload})\n"
-                "    assert response.status_code in (200, 201, 204, 400, 404)\n"
-            ),
-        })
-    return tests
+    cases = [build_request_case(endpoint, api_base_url, case_config, allow_mutating_methods) for endpoint in endpoints]
+    return [{
+        "id": "api_configured_matrix",
+        "title": "API configured test matrix",
+        "description": "Configuration-aware API checks for detected endpoints.",
+        "cases": cases,
+        "code": generated_test_code(cases, api_base_url),
+    }]
 
 
 def default_payload(method: str) -> str:
@@ -537,6 +912,7 @@ def build_chinese_report(summary: Dict[str, object], junit_cases: List[Dict[str,
     success_rate = f"{(passed / total * 100):.1f}%" if total else "0.0%"
     total_duration = sum(float(case.get("time") or 0) for case in junit_cases)
     endpoints = summary.get("detected_endpoints", [])
+    request_cases = summary.get("request_cases", [])
     generated_tests = summary.get("generated_tests", [])
     returncode = summary.get("pytest_returncode", "未执行")
     generated_at = summary.get("generated_at", "")
@@ -577,11 +953,31 @@ def build_chinese_report(summary: Dict[str, object], junit_cases: List[Dict[str,
             "</tr>"
         )
 
+    def request_case_row(case: Dict[str, Any]) -> str:
+        assertion_count = len(case.get("assertions") or [])
+        skip_reason = case.get("skip_reason") or ""
+        redacted_request = truncate_and_redact(case.get("redacted_request", {}), 1000)
+        return (
+            "<tr>"
+            f"<td>{html.escape(str(case.get('method', '')))}</td>"
+            f"<td>{html.escape(str(case.get('url', '')))}</td>"
+            f"<td>{html.escape(str(case.get('source_kind', '')))}</td>"
+            f"<td>{html.escape(str(case.get('source', '')))}</td>"
+            f"<td>{html.escape(str(case.get('expected_status', '')))}</td>"
+            f"<td>{html.escape(str(assertion_count))}</td>"
+            f"<td>{html.escape(skip_reason)}</td>"
+            f"<td><pre>{html.escape(redacted_request)}</pre></td>"
+            "</tr>"
+        )
+
     endpoint_rows = "\n".join(endpoint_row(endpoint) for endpoint in endpoints) or (
         "<tr><td colspan=\"5\">未发现接口</td></tr>"
     )
     case_rows = "\n".join(case_row(case) for case in junit_cases) or (
         "<tr><td colspan=\"5\">暂无测试用例结果</td></tr>"
+    )
+    request_case_rows = "\n".join(request_case_row(case) for case in request_cases) or (
+        "<tr><td colspan=\"8\">暂无接口执行明细</td></tr>"
     )
     generated_rows = "\n".join(
         f"<li>{html.escape(str(path))}</li>" for path in generated_tests
@@ -651,6 +1047,12 @@ def build_chinese_report(summary: Dict[str, object], junit_cases: List[Dict[str,
     <tbody>{endpoint_rows}</tbody>
   </table>
 
+  <h2>接口执行明细</h2>
+  <table>
+    <thead><tr><th>方法</th><th>URL</th><th>来源类型</th><th>来源</th><th>期望状态码</th><th>断言数</th><th>跳过原因</th><th>脱敏请求参数</th></tr></thead>
+    <tbody>{request_case_rows}</tbody>
+  </table>
+
   <h2>生成的测试文件</h2>
   <ul>{generated_rows}</ul>
 
@@ -692,6 +1094,8 @@ def main() -> int:
     parser.add_argument("--service-health-url", default=None, help="Health check URL for the service under test")
     parser.add_argument("--service-timeout", type=int, default=30, help="Service startup timeout in seconds")
     parser.add_argument("--data-driven", action="store_true", help="Generate a parameterized test matrix")
+    parser.add_argument("--case-config", type=Path, help="YAML file with endpoint request data, assertions, and safety settings")
+    parser.add_argument("--allow-mutating-methods", action="store_true", help="Allow POST/PUT/PATCH/DELETE only when endpoint config also sets allow_mutating: true")
     parser.add_argument("--dry-run", action="store_true", help="Only scan sources and write the summary")
     args = parser.parse_args()
 
@@ -731,20 +1135,27 @@ def main() -> int:
     frontend = collect_source(dedupe_paths(frontend_paths + extra_files), FRONTEND_EXTENSIONS)
     backend = collect_source(dedupe_paths(backend_paths + extra_files), BACKEND_EXTENSIONS)
     openapi_docs = load_openapi_documents(dedupe_paths(openapi_paths))
+    try:
+        case_config = load_case_config(args.case_config)
+    except (OSError, RuntimeError, ValueError, yaml.YAMLError if yaml is not None else Exception) as exc:
+        print(f"读取 case config 失败：{exc}", file=sys.stderr)
+        return 1
 
-    if not frontend and not backend and not openapi_docs:
+    if not frontend and not backend and not openapi_docs and not case_config.get("endpoints"):
         print(
             "未找到可扫描的源码或 OpenAPI 文档。请检查路径，或显式传入 --frontend-dir、--backend-dir、--openapi-path。",
             file=sys.stderr,
         )
         return 1
 
-    endpoints = extract_api_endpoints({**frontend, **backend}, openapi_docs)
+    endpoints = endpoints_with_case_config(extract_api_endpoints({**frontend, **backend}, openapi_docs), case_config)
+    request_cases = [build_request_case(endpoint, args.api_base_url, case_config, args.allow_mutating_methods) for endpoint in endpoints]
     summary = {
         "frontend_files": list(frontend.keys()),
         "backend_files": list(backend.keys()),
         "openapi_files": list(openapi_docs.keys()),
         "detected_endpoints": endpoints,
+        "request_cases": request_cases,
         "auto_detected": auto_detected,
         "project_root": str(project_root),
         "scan_inputs": {
@@ -755,6 +1166,8 @@ def main() -> int:
         },
         "mode": args.mode,
         "api_base_url": args.api_base_url,
+        "case_config_file": str(args.case_config) if args.case_config else None,
+        "allow_mutating_methods": args.allow_mutating_methods,
         "generated_at": datetime.utcnow().isoformat(),
     }
 
@@ -773,7 +1186,16 @@ def main() -> int:
             return 1
 
     try:
-        tests = generate_tests(frontend, backend, args.mode, args.api_base_url, openapi_docs, args.data_driven)
+        tests = generate_tests(
+            frontend,
+            backend,
+            args.mode,
+            args.api_base_url,
+            openapi_docs,
+            args.data_driven,
+            case_config,
+            args.allow_mutating_methods,
+        )
         written_files = write_tests(tests, args.output_dir)
         summary["generated_tests"] = [str(path) for path in written_files]
 

@@ -35,6 +35,7 @@ jobs:
 
       - name: Run tests
         run: |
+          python tools/sync_skill_script.py --check
           pytest --junitxml=artifacts/junit.xml
 
       - name: Upload test report
